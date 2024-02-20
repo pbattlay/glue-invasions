@@ -1,0 +1,443 @@
+##########
+### BAYPASS CONTRAST MODEL
+### PAUL BATTLAY
+##########
+
+# EXAMPLE FOR CONTRAST BETWEEN EUROPE AND NORTH AMERICA
+# combine BAM lists from two ranges
+cat EU-range-3-23.csv nAM-range-3-23.csv | awk -F "," '{print $4}' > EU-nAM-3-23.bamlist
+
+# run allele frequency calling to identify polymorphic SNPs (contrast)
+
+# EU-nAM.sh
+#!/bin/bash
+#SBATCH --job-name=EU-nAM
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=36:00:00
+#SBATCH --output=EU-nAM-%a.out
+#SBATCH --error=EU-nAM-%a.err
+#SBATCH --array=1-16
+
+cd ~/scratch/clover-contrast/
+
+N=$SLURM_ARRAY_TASK_ID
+CONTIG=$(cat chromosome_file.txt | head -n $N | tail -n 1)
+
+module load angsd
+
+angsd \
+-bam EU-nAM-3-23.bamlist \
+-r $CONTIG: \
+-nThreads 12 \
+-GL 1 \
+-doGlf 2 \
+-doMajorMinor 4 \
+-doMaf 2 \
+-baq 2 \
+-minQ 20 \
+-minMapQ 30 \
+-SNP_pval 1e-6 \
+-minMaf 0.05 \
+-ref TrR_v6_haploid_reference.fasta \
+-out EU-nAM-$N
+
+###
+
+# get a list of all sites
+for i in EU-nAM-*.mafs.gz
+do
+zcat $i | tail -n +2 | awk '{print $1, $2}'
+done > EU-nAM.sites
+
+# index sites file
+module load angsd
+angsd sites index EU-nAM.sites
+
+
+# get a population list and a list of bam files for each population
+for RANGE in EU nAM sAM OC CN JP
+do
+cat $RANGE-range-3-23.csv | awk -F "," -v RANGE=$RANGE '$3 == RANGE {print $2}' | sort -u > $RANGE.poplist
+while read POP
+do
+cat $RANGE-range-3-23.csv | awk -F "," -v POP=$POP '$2 == POP {print $4}' > $POP.bamlist
+done < $RANGE.poplist
+done
+
+# make population lists for contrast
+for RANGE in nAM sAM OC CN JP
+do
+cat EU.poplist $RANGE.poplist > EU-$RANGE.poplist
+wc -l EU-$RANGE.poplist
+done
+
+# 23 EU-nAM.poplist
+# 22 EU-sAM.poplist
+# 20 EU-OC.poplist
+# 16 EU-CN.poplist
+# 16 EU-JP.poplist
+
+# slurm script to get allele frequencies of each SNP in each population across two ranges
+# popAF-EU-nAM.sh
+#!/bin/bash
+#SBATCH --job-name=popAF-EU-nAM
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem-per-cpu=20G
+#SBATCH --time=36:00:00
+#SBATCH --output=popAF-EU-nAM-%a.out
+#SBATCH --error=popAF-EU-nAM-%a.err
+#SBATCH --array=1-23
+
+cd ~/scratch/clover-contrast/
+
+N=$SLURM_ARRAY_TASK_ID
+POP=$(cat EU-nAM.poplist | head -n $N | tail -n 1)
+
+module load angsd
+
+angsd \
+-bam $POP.bamlist \
+-sites EU-nAM.sites \
+-nThreads 12 \
+-GL 1 \
+-doGlf 2 \
+-doMajorMinor 4 \
+-doMaf 2 \
+-doCounts 1 \
+-baq 2 \
+-minQ 20 \
+-minMapQ 30 \
+-minMaf 0 \
+-ref TrR_v6_haploid_reference.fasta \
+-out $POP-EU-nAM
+
+###
+
+# combining and formatting files--getting around R memory issues
+cd ~/scratch/clover-contrast/
+
+RANGE="EU-nAM"
+
+mkdir $RANGE-filtering
+
+for i in *-$RANGE.mafs.gz
+do
+zcat $i | tail -n +2 | awk '$7 >= 2 {print $1 ":" $2, $6, $7}' > $RANGE-filtering/$i.filtered
+cat $RANGE-filtering/$i.filtered | awk '{print $1}' > $RANGE-filtering/$i.filtered.snps
+done
+
+# get a list of SNPs called in all populations
+# in R
+RANGE = "EU-nAM"
+
+setwd(paste0("~/scratch/clover-contrast/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".poplist"), what = "list")
+
+SNPs.1 = scan(paste0(POPS[1], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.2 = scan(paste0(POPS[2], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.cons = SNPs.1[which(SNPs.1 %in% SNPs.2)]
+
+for (i in 3:length(POPS)){
+SNPs.i = scan(paste0(POPS[i], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.cons = SNPs.cons[which(SNPs.cons %in% SNPs.i)]
+print(length(SNPs.cons))
+
+}
+
+write.table(SNPs.cons, file = paste0("~/scratch/clover-contrast/", RANGE, ".snps"), col.names = F, row.names = F, quote = F)
+
+###
+
+# get genotypes for SNPs
+# in R
+library(data.table)
+
+RANGE = "EU-nAM"
+
+setwd(paste0("~/scratch/clover-contrast/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".poplist"), what = "list")
+SNPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".snps"), what = 'list')
+
+# loop over populations
+for (i in 1:length(POPS)){
+POP = POPS[i]
+
+pop.af = fread(paste0(POP, "-", RANGE, ".mafs.gz.filtered"), header = F)
+
+# filter down to consensus SNPs
+pop.af = pop.af[which(pop.af$V1 %in% SNPS), ]
+
+# genotypes (frequency x number of haploid genomes in pop)
+pop.af$G1 = round(pop.af$V2 * pop.af$V3 * 2)
+pop.af$G2 = pop.af$V3 * 2 - pop.af$G1
+
+# now remove unwanted columns
+pop.af = pop.af[, c("V1", "G1", "G2")]
+colnames(pop.af) = c("SNP", paste0(POP, ".G1"), paste0(POP, ".G2"))
+
+write.table(pop.af, file = paste0(POP, "-", RANGE, ".mafs.gz.filtered.2"), col.names = T, row.names = F, quote = F)
+
+print(paste0(i, " complete"))
+
+}
+
+###
+
+# merge files
+# in R
+library(data.table)
+
+setwd("~/scratch/clover-contrast/")
+
+RANGE = "EU-nAM"
+
+POPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".poplist"), what = "list")
+
+gt = fread(paste0(RANGE, "-filtering/", POPS[1], "-", RANGE, ".mafs.gz.filtered.2"), header = T)
+
+# loop over populations
+for (i in 2:length(POPS)){
+POP = POPS[i]
+
+pop.gt = fread(paste0(RANGE, "-filtering/", POP, "-", RANGE, ".mafs.gz.filtered.2"), header = T)
+
+gt = cbind(gt, pop.gt[, c(2, 3)])
+
+print(i)
+}
+
+# write out files for BayPass
+write.table(gt[, 2:ncol(gt)], file = paste0(RANGE, "-bp.gt"), col.names = F, row.names = F, quote = F)
+write.table(gt$SNP, file = paste0(RANGE, "-bp.snps"), col.names = F, row.names = F, quote = F)
+
+###
+
+# make omega matrix
+cat ~/projects/def-johnso73/data/resources/TrR_v6_dovetail/TrR_v6_brakerCombined_tsebraRenamed_withUTRs.gtf \
+| awk -F "\t" '$1 != "Mitochondria" {print $0}' \
+| awk '$1 != "Plastid" {print $0}' \
+| awk '$3 == "gene" {print $1, $4, $5}' > genelocs.txt
+
+RANGE="EU-nAM"
+
+# get a list of BayPass SNPs in genes
+while read contig start end
+do
+cat $RANGE-bp.snps | awk -F ":" -v contig=$contig -v start=$start -v end=$end '$1 == contig && $2 >= start && $2 <= end {print $1 ":" $2}'
+done < genelocs.txt > $RANGE-bp.snps.ingenes
+
+# in R
+library(data.table)
+library(Hmisc)
+
+RANGE = "EU-nAM"
+
+pop.af.merged = as.data.frame(fread(paste0(RANGE, "-bp.gt"), header = F))
+rownames(pop.af.merged) = scan(paste0(RANGE, "-bp.snps"), what = "list")
+
+gene.snps = unique(scan(paste0(RANGE, "-bp.snps.ingenes"), what = "list"))
+
+# remove SNPs in gene regions
+pop.af.omega = pop.af.merged[which(rownames(pop.af.merged) %nin% gene.snps), ]
+
+# downsample to 10k SNPs
+pop.af.omega = pop.af.omega[sample(nrow(pop.af.omega), 10000), ]
+
+write.table(pop.af.omega, file = paste0(RANGE, "-bp-omega.gt"), col.names = F, row.names = F, quote = F)
+write.table(rownames(pop.af.omega), file = paste0(RANGE, "-bp-omega.snps"), col.names = F, row.names = F, quote = F)
+
+# back in bash
+# run BayPass to generate omega matrix
+
+# baypass-EU-nAM-omega.sh
+#!/bin/bash
+#SBATCH --job-name=baypass-EU-nAM-omega
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=20G
+#SBATCH --time=02:00:00
+#SBATCH --output=baypass-EU-nAM-omega.out
+#SBATCH --error=baypass-EU-nAMomega.err
+
+module load StdEnv/2020 
+module load gcc/9.3.0
+module load baypass/2.2
+
+g_baypass -gfile EU-nAM-bp-omega.gt -outprefix EU-nAM-10k
+
+# split dataset into 50000-varaint chunks
+split -l 50000 --numeric-suffixes EU-nAM-bp.gt EU-nAM-bp.gt-part-
+
+# EU-nAM.contrast
+# contrast file which distinguishes populations from each range
+1 1 1 1 1 1 1 1 1 1 1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+
+# EU-nAM-contrast.sh
+#!/bin/bash
+#SBATCH --job-name=EU-nAM-contrast
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=20G
+#SBATCH --time=24:00:00
+#SBATCH --output=EU-nAM-contrast-%a.out
+#SBATCH --error=EU-nAM-contrast-%a.err
+#SBATCH --array=1-76
+
+N=$SLURM_ARRAY_TASK_ID
+GT=$(ls EU-nAM-bp.gt-part-* | head -n $N | tail -n 1)
+
+module load StdEnv/2020 
+module load gcc/9.3.0
+module load baypass/2.2
+
+g_baypass -gfile $GT -omegafile EU-nAM-10k_mat_omega.out -contrastfile EU-nAM.contrast -outprefix $GT-out
+
+###
+
+# make WZA input files
+library(data.table)
+
+RANGE = "EU-nAM"
+
+setwd(paste0("~/scratch/clover-contrast/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".poplist"), what = "list")
+SNPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".snps"), what = 'list')
+
+# loop over populations
+for (i in 1:length(POPS)){
+POP = POPS[i]
+
+pop.af = fread(paste0(POP, "-", RANGE, ".mafs.gz.filtered"), header = F)
+
+# filter down to consensus SNPs
+pop.af = pop.af[which(pop.af$V1 %in% SNPS), ]
+
+write.table(pop.af, file = paste0(POP, "-", RANGE, ".mafs.gz.filtered.wza"), col.names = F, row.names = F, quote = F)
+
+print(paste0(i, " complete"))
+
+}
+
+###
+
+# merge files and make WZA WIND and MAF columns
+library(data.table)
+library(dplyr)
+library(tidyr)
+
+setwd("~/scratch/clover-contrast/")
+
+RANGE = "EU-nAM"
+
+POPS = scan(paste0("~/scratch/clover-contrast/", RANGE, ".poplist"), what = "list")
+
+gt = fread(paste0(RANGE, "-filtering/", POPS[1], "-", RANGE, ".mafs.gz.filtered.wza"), header = F)[, c(1, 2)]
+
+# loop over populations
+for (i in 2:length(POPS)){
+POP = POPS[i]
+
+pop.gt = fread(paste0(RANGE, "-filtering/", POP, "-", RANGE, ".mafs.gz.filtered.wza"), header = F)
+
+gt = cbind(gt, pop.gt[, 2])
+
+print(i)
+}
+
+# mean allele frequency
+af.mean = rowMeans(gt[, 2:ncol(gt)])
+
+# convert to MAF
+for (k in 1:length(af.mean)){
+if (af.mean[k] > 0.5){
+af.mean[k] = 1 - af.mean[k]
+}
+}
+
+# assign SNPs to windows
+wsz = 20000
+
+snps = as.data.frame(cbind(gt$V1, gt$V1))
+snps = separate(data = snps, col = V2, into = c("CHR", "LOC"), sep = ":")
+snps$LOC = as.numeric(snps$LOC)
+colnames(snps)[1] = "SNP"
+snps$WIND = paste0(snps$CHR, ":", ceiling(snps$LOC / wsz) * wsz - wsz + 1, "-", ceiling(snps$LOC / wsz) * wsz)
+
+# WZA data
+wza = as.data.frame(cbind(snps$SNP, snps$WIND, af.mean))
+colnames(wza) = c("SNP", "WIND", "MAF")
+
+# write out
+write.table(wza, file = paste0(RANGE, ".wza1"), col.names = T, row.names = F, quote = F)
+
+###
+
+# BayPass contrast results analysis
+# in R
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+
+setwd("~/scratch/clover-contrast/")
+
+RANGE = "EU-nAM"
+
+# read in BayPass data
+file.names = dir(pattern = paste0(RANGE, "-bp.gt-part-(.*)-out_summary_contrast.out$"))
+
+bpout = matrix(ncol = 7, nrow = 0)
+
+for (j in 1:length(file.names)){
+bpout.t = as.data.frame(fread(file.names[j], header = T))
+bpout = rbind(bpout, bpout.t)
+}
+bpout$SNP = scan(paste0(RANGE, "-bp.snps"), what = "list")
+
+bpout$C2.PVAL = 1 / (10 ^ bpout$"log10(1/pval)")
+
+bpout = bpout[, c("SNP", "C2_std", "C2.PVAL")]
+
+write.table(bpout,
+	file = paste0(RANGE, "-contrast.stats"),
+	row.names = F,
+	col.names = T,
+	quote = F)
+
+wza = fread(paste0(RANGE, ".wza1"), header = T)
+
+wzain = as.data.frame(cbind(wza$SNP, wza$WIND, bpout$C2.PVAL, wza$MAF))
+colnames(wzain) = c("SNP", "WIND", "P", "MAF")
+
+write.table(wzain,
+	file = paste0(RANGE, ".wzain.csv"),
+	row.names = F,
+	col.names = T,
+	quote = F,
+	sep = ",")
+
+# run the WZA
+module load scipy-stack/2023a
+
+python3 general_WZA_script.py \
+--correlations EU-nAM.wzain.csv \
+--summary_stat P \
+--window WIND \
+--MAF MAF \
+--output EU-nAM.wzaout.csv \
+--sep ","
