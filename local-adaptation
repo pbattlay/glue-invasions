@@ -1,0 +1,465 @@
+##########
+### BAYPASS CORE MODEL AND ENVIRONMENTAL VARIABLE CORRELATIONS
+### PAUL BATTLAY
+##########
+
+cd ~/scratch/clover-baypass/
+
+# EXAMPLE: North America
+RANGE="nAM"
+
+# Make BAM list from a metadata file
+cat ~/scratch/clover-contrast/$RANGE-range-3-23.csv | awk -F "," '{print $4}' > $RANGE-3-23.bamlist
+
+# run allele frequency calling to identify polymorphic SNPs
+# nAM.sh
+#!/bin/bash
+#SBATCH --job-name=nAM
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=36:00:00
+#SBATCH --output=nAM-%a.out
+#SBATCH --error=nAM-%a.err
+#SBATCH --array=1-16
+
+cd ~/scratch/clover-baypass/
+
+N=$SLURM_ARRAY_TASK_ID
+CONTIG=$(cat chromosome_file.txt | head -n $N | tail -n 1)
+
+module load angsd
+
+angsd \
+-bam nAM-3-23.bamlist \
+-r $CONTIG: \
+-nThreads 12 \
+-GL 1 \
+-doGlf 2 \
+-doMajorMinor 4 \
+-doMaf 2 \
+-baq 2 \
+-minQ 20 \
+-minMapQ 30 \
+-SNP_pval 1e-6 \
+-minMaf 0.05 \
+-ref TrR_v6_haploid_reference.fasta \
+-out nAM-$N
+
+###
+
+# get a list of all sites
+for i in $RANGE-*.mafs.gz
+do
+zcat $i | tail -n +2 | awk '{print $1, $2}'
+done > $RANGE.sites
+
+module load angsd
+
+angsd sites index $RANGE.sites
+
+# get allele frequency for each site (regardless of MAF) in each population
+# popAF-nAM.sh
+#!/bin/bash
+#SBATCH --job-name=popAF-nAM
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=36:00:00
+#SBATCH --output=popAF-nAM-%a.out
+#SBATCH --error=popAF-nAM-%a.err
+#SBATCH --array=1-11
+
+cd ~/scratch/clover-baypass/
+
+N=$SLURM_ARRAY_TASK_ID
+POP=$(cat nAM.poplist | head -n $N | tail -n 1)
+
+module load angsd
+
+angsd \
+-bam $POP.bamlist \
+-sites nAM.sites \
+-nThreads 12 \
+-GL 1 \
+-doGlf 2 \
+-doMajorMinor 4 \
+-doMaf 2 \
+-doCounts 1 \
+-baq 2 \
+-minQ 20 \
+-minMapQ 30 \
+-minMaf 0 \
+-ref TrR_v6_haploid_reference.fasta \
+-out $POP-nAM
+
+###
+
+# this all gets a bit complicated because of memory issues in R
+cd ~/scratch/clover-baypass/
+
+RANGE="nAM"
+
+mkdir $RANGE-filtering
+
+for i in *-$RANGE.mafs.gz
+do
+zcat $i | tail -n +2 | awk '$7 >= 2 {print $1 ":" $2, $6, $7}' > $RANGE-filtering/$i.filtered
+cat $RANGE-filtering/$i.filtered | awk '{print $1}' > $RANGE-filtering/$i.filtered.snps
+done
+
+# get a list of SNPs called in all populations
+# in R
+RANGE = "nAM"
+
+setwd(paste0("~/scratch/clover-baypass/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".poplist"), what = "list")
+
+SNPs.1 = scan(paste0(POPS[1], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.2 = scan(paste0(POPS[2], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.cons = SNPs.1[which(SNPs.1 %in% SNPs.2)]
+
+for (i in 3:length(POPS)){
+SNPs.i = scan(paste0(POPS[i], "-", RANGE, ".mafs.gz.filtered.snps"), what = 'list')
+SNPs.cons = SNPs.cons[which(SNPs.cons %in% SNPs.i)]
+print(length(SNPs.cons))
+
+}
+
+write.table(SNPs.cons, file = paste0("~/scratch/clover-baypass/", RANGE, ".snps"), col.names = F, row.names = F, quote = F)
+
+###
+
+# get genotypes for SNPs
+# in R
+library(data.table)
+
+RANGE = "nAM"
+
+setwd(paste0("~/scratch/clover-baypass/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".poplist"), what = "list")
+SNPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".snps"), what = 'list')
+
+# loop over populations
+for (i in 1:length(POPS)){
+POP = POPS[i]
+
+pop.af = fread(paste0(POP, "-", RANGE, ".mafs.gz.filtered"), header = F)
+
+# filter down to consensus SNPs
+pop.af = pop.af[which(pop.af$V1 %in% SNPS), ]
+
+# genotypes (frequency x number of haploid genomes in pop)
+pop.af$G1 = round(pop.af$V2 * pop.af$V3 * 2)
+pop.af$G2 = pop.af$V3 * 2 - pop.af$G1
+
+# now remove unwanted columns
+pop.af = pop.af[, c("V1", "G1", "G2")]
+colnames(pop.af) = c("SNP", paste0(POP, ".G1"), paste0(POP, ".G2"))
+
+write.table(pop.af, file = paste0(POP, "-", RANGE, ".mafs.gz.filtered.2"), col.names = T, row.names = F, quote = F)
+
+print(paste0(i, " complete"))
+
+}
+
+###
+
+# merge files
+# in R
+library(data.table)
+
+setwd("~/scratch/clover-baypass/")
+
+RANGE = "nAM"
+
+POPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".poplist"), what = "list")
+
+gt = fread(paste0(RANGE, "-filtering/", POPS[1], "-", RANGE, ".mafs.gz.filtered.2"), header = T)
+
+# loop over populations
+for (i in 2:length(POPS)){
+POP = POPS[i]
+
+pop.gt = fread(paste0(RANGE, "-filtering/", POP, "-", RANGE, ".mafs.gz.filtered.2"), header = T)
+
+gt = cbind(gt, pop.gt[, c(2, 3)])
+
+print(i)
+}
+
+# write out files for BayPass
+write.table(gt[, 2:ncol(gt)], file = paste0(RANGE, "-bp.gt"), col.names = F, row.names = F, quote = F)
+write.table(gt$SNP, file = paste0(RANGE, "-bp.snps"), col.names = F, row.names = F, quote = F)
+
+###
+
+# make omega matrix
+# in R
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(Hmisc)
+
+RANGE = "nAM"
+
+# read in gene regions
+genes = read.table("genelocs.txt", header = F)
+
+# some genes are backwards; revese these regions
+genes$start = genes$end = NA
+
+for (i in 1:nrow(genes)){
+genes$start[i] = min(genes$V2[i], genes$V3[i])
+genes$end[i] = max(genes$V2[i], genes$V3[i])
+}
+
+genes = genes[, c("V1", "start", "end")]
+colnames(genes)[1] = "chr"
+
+# read in baypass data
+pop.af.merged = as.data.frame(fread(paste0(RANGE, "-bp.gt"), header = F))
+
+# make a SNP list
+snps = rownames(pop.af.merged) = scan(paste0(RANGE, "-bp.snps"), what = "list")
+snps = as.data.frame(snps) %>% separate(snps, c("chr", "start"), ":")
+snps$end = snps$start = as.numeric(snps$start)
+
+# get the overlap between the SNP list and genes
+setDT(snps, key = c("chr", "start", "end"))
+setDT(genes, key = c("chr", "start", "end"))
+
+gene.snps = foverlaps(as.data.table(snps), as.data.table(genes), type = "within", nomatch = 0L)
+gene.snps = unique(paste0(gene.snps$chr, ":", gene.snps$i.start))
+
+# remove SNPs in gene regions
+pop.af.omega = pop.af.merged[which(rownames(pop.af.merged) %nin% gene.snps), ]
+
+# downsample to 10k SNPs
+pop.af.omega = pop.af.omega[sample(nrow(pop.af.omega), 10000), ]
+
+write.table(pop.af.omega, file = paste0(RANGE, "-bp-omega.gt"), col.names = F, row.names = F, quote = F)
+write.table(rownames(pop.af.omega), file = paste0(RANGE, "-bp-omega.snps"), col.names = F, row.names = F, quote = F)
+
+# run BayPass to generate omega matrix
+
+# baypass-nAM-omega.sh
+#!/bin/bash
+#SBATCH --job-name=baypass-nAM-omega
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=20G
+#SBATCH --time=02:00:00
+#SBATCH --output=baypass-nAM-omega.out
+#SBATCH --error=baypass-nAM-omega.err
+
+module load StdEnv/2020 
+module load gcc/9.3.0
+module load baypass/2.2
+
+g_baypass -gfile nAM-bp-omega.gt -outprefix nAM-10k
+
+###
+
+# make WZA input files
+library(data.table)
+
+RANGE = "nAM"
+
+setwd(paste0("~/scratch/clover-baypass/", RANGE, "-filtering/"))
+
+POPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".poplist"), what = "list")
+SNPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".snps"), what = 'list')
+
+# loop over populations
+for (i in 1:length(POPS)){
+POP = POPS[i]
+
+pop.af = fread(paste0(POP, "-", RANGE, ".mafs.gz.filtered"), header = F)
+
+# filter down to consensus SNPs
+pop.af = pop.af[which(pop.af$V1 %in% SNPS), ]
+
+write.table(pop.af, file = paste0(POP, "-", RANGE, ".mafs.gz.filtered.wza"), col.names = F, row.names = F, quote = F)
+
+print(paste0(i, " complete"))
+
+}
+
+###
+
+# merge files and make WZA WIND and MAF columns
+library(data.table)
+library(dplyr)
+library(tidyr)
+
+setwd("~/scratch/clover-baypass/")
+
+RANGE = "nAM"
+
+POPS = scan(paste0("~/scratch/clover-baypass/", RANGE, ".poplist"), what = "list")
+
+gt = fread(paste0(RANGE, "-filtering/", POPS[1], "-", RANGE, ".mafs.gz.filtered.wza"), header = F)[, c(1, 2)]
+
+# loop over populations
+for (i in 2:length(POPS)){
+POP = POPS[i]
+
+pop.gt = fread(paste0(RANGE, "-filtering/", POP, "-", RANGE, ".mafs.gz.filtered.wza"), header = F)
+
+gt = cbind(gt, pop.gt[, 2])
+
+print(i)
+}
+
+# mean allele frequency
+af.mean = rowMeans(gt[, 2:ncol(gt)])
+
+# convert to MAF
+for (k in 1:length(af.mean)){
+if (af.mean[k] > 0.5){
+af.mean[k] = 1 - af.mean[k]
+}
+}
+
+# assign SNPs to windows
+wsz = 20000
+
+snps = as.data.frame(cbind(gt$V1, gt$V1))
+snps = separate(data = snps, col = V2, into = c("CHR", "LOC"), sep = ":")
+snps$LOC = as.numeric(snps$LOC)
+colnames(snps)[1] = "SNP"
+snps$WIND = paste0(snps$CHR, ":", ceiling(snps$LOC / wsz) * wsz - wsz + 1, "-", ceiling(snps$LOC / wsz) * wsz)
+
+# WZA data
+wza = as.data.frame(cbind(snps$SNP, snps$WIND, af.mean))
+colnames(wza) = c("SNP", "WIND", "MAF")
+
+# write out
+write.table(wza, file = paste0(RANGE, ".wza1"), col.names = T, row.names = F, quote = F)
+
+###
+
+#####
+# BayPass and EAA
+#####
+
+# split BayPass dataset into 50000-varaint chunks
+split -l 50000 --numeric-suffixes $RANGE-bp.gt $RANGE-bp.gt-part-
+
+# count chunks for script
+ls $RANGE-bp.gt-part-* | wc -l
+
+# nAM-baypass.sh
+#!/bin/bash
+#SBATCH --job-name=nAM-baypass
+#SBATCH --account=def-johnso73
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=24:00:00
+#SBATCH --output=nAM-baypass-%a.out
+#SBATCH --error=nAM-baypass-%a.err
+#SBATCH --array=1-120
+
+N=$SLURM_ARRAY_TASK_ID
+GT=$(ls nAM-bp.gt-part-* | head -n $N | tail -n 1)
+
+module load StdEnv/2020 
+module load gcc/9.3.0
+module load baypass/2.2
+module load r
+
+g_baypass -gfile $GT -omegafile nAM-10k_mat_omega.out -outprefix $GT-out
+
+Rscript EAA.R nAM $N
+
+###
+
+# merge EAA file parts
+files=$(ls ${RANGE}-BIO1.wzain-part*.csv | wc -l)
+
+for v in $(seq 1 19)
+do
+echo "SNP,WIND,TAU,MAF" > ${RANGE}-BIO${v}.wzain.csv
+for i in $(seq 1 $files)
+do
+cat ${RANGE}-BIO${v}.wzain-part${i}.csv >> ${RANGE}-BIO${v}.wzain.csv
+done
+done
+
+# in R
+# BayPass XtX results analysis
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+
+setwd("~/scratch/clover-baypass/")
+
+RANGE = "nAM"
+
+# read in BayPass data
+file.names = dir(pattern = paste0(RANGE, "-bp.gt-part-(.*)_summary_pi_xtx.out$"))
+
+bpout = matrix(ncol = 7, nrow = 0)
+
+for (j in 1:length(file.names)){
+bpout.t = as.data.frame(fread(file.names[j], header = T))
+bpout = rbind(bpout, bpout.t)
+}
+bpout$SNP = scan(paste0(RANGE, "-bp.snps"), what = "list")
+
+bpout = bpout[, c("SNP", "XtXst")]
+
+write.table(bpout,
+	file = paste0(RANGE, "-XtX.stats"),
+	row.names = F,
+	col.names = T,
+	quote = F)
+
+wza = fread(paste0(RANGE, ".wza1"), header = T)
+
+wzain = as.data.frame(cbind(wza$SNP, wza$WIND, bpout$XtXst, wza$MAF))
+colnames(wzain) = c("SNP", "WIND", "XTX", "MAF")
+
+write.table(wzain,
+	file = paste0(RANGE, ".wzain.csv"),
+	row.names = F,
+	col.names = T,
+	quote = F,
+	sep = ",")
+
+# run the WZA
+module load scipy-stack/2023a
+
+python3 general_WZA_script.py \
+--correlations ${RANGE}.wzain.csv \
+--summary_stat XTX \
+--large_i_small_p \
+--window WIND \
+--MAF MAF \
+--output ${RANGE}.wzaout.csv \
+--sep ","
+
+for v in $(seq 1 19)
+do
+python3 general_WZA_script.py \
+--correlations ${RANGE}-BIO${v}.wzain.csv \
+--summary_stat TAU \
+--large_i_small_p \
+--window WIND \
+--MAF MAF \
+--output ${RANGE}-BIO${v}.wzaout.csv \
+--sep ","
+done
