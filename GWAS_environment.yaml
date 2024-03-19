@@ -1,0 +1,10 @@
+name : GWAS_Trepens
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python
+  - mamba
+  - fastp
+  - bwa
+  - samtools
