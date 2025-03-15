@@ -1,0 +1,30 @@
+zcat genolike_091123.beagle.gz | \
+awk '
+#print and keep the very first header line
+FNR == 1 {
+  print
+  next
+}
+#identify chromosome and position, then distance filter.
+{
+  # "ChrXX_XXX_1234", split by "_" to single out chromosome name and position
+  split($1, arr, "_")
+  chr = arr[1] "_" arr[2]
+  pos = arr[3]
+
+  # If this is a new chromosome, keep the first identified site
+  if (!(chr in lastPos)) {
+    print
+    lastPos[chr] = pos
+  } else {
+    # Calculate distance from the last kept site
+    diff = pos - lastPos[chr]
+    
+    # If the current position from last position difference is >= 10,000 bases then keep site and update lastPos
+    if (diff >= 10000) {
+      print
+      lastPos[chr] = pos
+    }
+  }
+}
+' | gzip > genolike_091123_4foldsites10kbLD.beagle.gz

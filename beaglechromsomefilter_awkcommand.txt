@@ -1,0 +1,1 @@
+zcat genolike_091123.beagle.gz | awk -v pattern="Chr04_Occ|Chr05_Occ|Chr07_Occ" '$1 !~ pattern' | gzip > genolike_091123_ChrOcc457Removed.beagle.gz
